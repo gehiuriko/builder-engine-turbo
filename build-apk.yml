@@ -1,0 +1,249 @@
+name: Turbo Android Build
+run-name: Turbo ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Turbo job ID
+        required: true
+        type: string
+      source_key:
+        description: B2 object key containing source ZIP
+        required: true
+        type: string
+      variant:
+        description: Android build variant
+        required: true
+        default: debug
+        type: choice
+        options: [debug, release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: turbo-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+  AWS_DEFAULT_REGION: ${{ secrets.B2_REGION }}
+  B2_REGION: ${{ secrets.B2_REGION }}
+  B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+  JOB_ID: ${{ inputs.job_id }}
+  SOURCE_KEY: ${{ inputs.source_key }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout clean public engine
+        uses: actions/checkout@v4
+
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${JOB_ID}" =~ ^job-[0-9]+-[A-Za-z0-9]+$ ]] || { echo "Invalid job_id"; exit 2; }
+          [[ "${SOURCE_KEY}" == "jobs/${JOB_ID}/source.zip" ]] || { echo "Invalid source_key"; exit 2; }
+          test -n "${B2_REGION}" && test -n "${B2_BUCKET}"
+          command -v aws >/dev/null || { echo "AWS CLI missing on runner"; exit 3; }
+          echo "B2_ENDPOINT=https://s3.${B2_REGION}.backblazeb2.com" >> "$GITHUB_ENV"
+          aws configure set default.s3.addressing_style path
+
+      - name: Status · preparing
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {"state":"preparing","job_id":"${JOB_ID}","message":"Runner aktif. Mengambil project dari Backblaze B2.","run_url":"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+          JSON
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --content-type application/json --no-progress
+
+      - name: Download source ZIP from B2
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://${B2_BUCKET}/${SOURCE_KEY}" "${RUNNER_TEMP}/project.zip" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress
+          ls -lh "${RUNNER_TEMP}/project.zip"
+
+      - name: Safely extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/safe_extract.py "${RUNNER_TEMP}/project.zip" "${RUNNER_TEMP}/project"
+
+      - name: Detect Gradle, AGP, JDK and SDK
+        id: detect
+        shell: bash
+        run: python3 scripts/detect_toolchain.py "${RUNNER_TEMP}/project"
+
+      - name: Status · detected
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {"state":"detecting","job_id":"${JOB_ID}","message":"Toolchain: AGP ${{ steps.detect.outputs.agp_version || 'unknown' }}, JDK ${{ steps.detect.outputs.java_version }}, compileSdk ${{ steps.detect.outputs.compile_sdk || 'auto' }}.","run_url":"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+          JSON
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --content-type application/json --no-progress
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Setup fallback Gradle
+        if: steps.detect.outputs.has_wrapper != 'true'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+          cache-read-only: false
+
+      - name: Setup Android SDK command line
+        uses: android-actions/setup-android@v3
+
+      - name: Ensure required Android platform
+        if: steps.detect.outputs.compile_sdk != ''
+        shell: bash
+        env:
+          COMPILE_SDK: ${{ steps.detect.outputs.compile_sdk }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "${ANDROID_SDK_ROOT}/platforms/android-${COMPILE_SDK}" ]; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platforms;android-${COMPILE_SDK}" "platform-tools"
+          else
+            echo "android-${COMPILE_SDK} already available; skip sdkmanager download."
+          fi
+
+      - name: Status · building
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {"state":"building","job_id":"${JOB_ID}","message":"Gradle sedang membuild ${{ inputs.variant }}.","run_url":"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+          JSON
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --content-type application/json --no-progress
+
+      - name: Build APK · Turbo cache
+        id: gradle_build
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.project_root }}
+          HAS_WRAPPER: ${{ steps.detect.outputs.has_wrapper }}
+          BUILD_VARIANT: ${{ inputs.variant }}
+        run: |
+          set -uo pipefail
+          cd "$PROJECT_ROOT"
+          TASK=assembleDebug
+          [ "$BUILD_VARIANT" = "release" ] && TASK=assembleRelease
+          LOG="${RUNNER_TEMP}/build.log"
+          {
+            echo "Turbo Android Builder V3"
+            echo "Project: $PROJECT_ROOT"
+            echo "Task: $TASK"
+            echo "Runner: $RUNNER_NAME"
+            echo
+          } > "$LOG"
+          set +e
+          if [ "$HAS_WRAPPER" = "true" ]; then
+            chmod +x ./gradlew
+            ./gradlew "$TASK" --build-cache --parallel --stacktrace 2>&1 | tee -a "$LOG"
+            code=${PIPESTATUS[0]}
+          else
+            gradle "$TASK" --build-cache --parallel --stacktrace 2>&1 | tee -a "$LOG"
+            code=${PIPESTATUS[0]}
+          fi
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "Gradle exit code: $code"
+          exit 0
+
+      - name: Collect APK files
+        id: collect
+        if: steps.gradle_build.outputs.exit_code == '0'
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.project_root }}
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/apk-output"
+          mkdir -p "$OUT"
+          count=0
+          while IFS= read -r -d '' apk; do
+            count=$((count+1))
+            rel="${apk#${PROJECT_ROOT}/}"
+            module="${rel%%/build/*}"
+            module="${module//\//-}"
+            base="$(basename "$apk")"
+            if [ -n "$module" ] && [ "$module" != "$rel" ]; then target="${module}-${base}"; else target="$base"; fi
+            target="$(printf '%s' "$target" | sed 's/[^A-Za-z0-9._-]/_/g')"
+            [ -e "$OUT/$target" ] && target="${count}-${target}"
+            cp "$apk" "$OUT/$target"
+            echo "Collected $target"
+          done < <(find "$PROJECT_ROOT" -type f -path '*/build/outputs/apk/*' -name '*.apk' ! -name '*unaligned*' -print0)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          [ "$count" -gt 0 ]
+
+      - name: Status · publishing
+        if: steps.gradle_build.outputs.exit_code == '0' && steps.collect.outputs.count != '0'
+        shell: bash
+        run: |
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {"state":"publishing","job_id":"${JOB_ID}","message":"Build sukses. Mengirim APK langsung ke B2.","run_url":"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+          JSON
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --content-type application/json --no-progress
+
+      - name: Publish APK + log + success status to B2
+        id: publish
+        if: steps.gradle_build.outputs.exit_code == '0' && steps.collect.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/apk-output"
+          mkdir -p "${RUNNER_TEMP}/meta"
+          : > "${RUNNER_TEMP}/meta/files.tsv"
+          while IFS= read -r -d '' apk; do
+            name="$(basename "$apk")"
+            key="jobs/${JOB_ID}/results/${name}"
+            size="$(stat -c%s "$apk")"
+            aws s3 cp "$apk" "s3://${B2_BUCKET}/${key}" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress --content-type application/vnd.android.package-archive --content-disposition "attachment; filename=\"${name}\""
+            printf '%s\t%s\t%s\n' "$name" "$size" "$key" >> "${RUNNER_TEMP}/meta/files.tsv"
+          done < <(find "$OUT" -maxdepth 1 -type f -name '*.apk' -print0)
+          LOG_KEY="jobs/${JOB_ID}/build.log"
+          test -f "${RUNNER_TEMP}/build.log" || echo "Build completed without Gradle log." > "${RUNNER_TEMP}/build.log"
+          aws s3 cp "${RUNNER_TEMP}/build.log" "s3://${B2_BUCKET}/${LOG_KEY}" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress --content-type text/plain --content-disposition 'attachment; filename="build.log"'
+          python3 - <<'PY'
+          import json, os, pathlib, datetime
+          rows=[]
+          for line in pathlib.Path(os.environ['RUNNER_TEMP'],'meta','files.tsv').read_text().splitlines():
+              name,size,key=line.split('\t',2); rows.append({'name':name,'size':int(size),'key':key})
+          data={'state':'success','job_id':os.environ['JOB_ID'],'message':'BUILD SUCCESSFUL — APK siap direct download dari Backblaze B2.','files':rows,'log_key':f"jobs/{os.environ['JOB_ID']}/build.log",'run_url':f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",'finished_at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          pathlib.Path(os.environ['RUNNER_TEMP'],'status.json').write_text(json.dumps(data,indent=2),encoding='utf-8')
+          PY
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress --content-type application/json
+          aws s3 rm "s3://${B2_BUCKET}/${SOURCE_KEY}" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" || true
+
+      - name: Publish failure status and log
+        if: always() && steps.publish.outcome != 'success'
+        shell: bash
+        run: |
+          set +e
+          test -f "${RUNNER_TEMP}/build.log" || {
+            echo "Turbo build failed before/during Gradle." > "${RUNNER_TEMP}/build.log"
+            echo "Actions run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "${RUNNER_TEMP}/build.log"
+          }
+          LOG_KEY="jobs/${JOB_ID}/build.log"
+          aws s3 cp "${RUNNER_TEMP}/build.log" "s3://${B2_BUCKET}/${LOG_KEY}" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress --content-type text/plain --content-disposition 'attachment; filename="build.log"'
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {"state":"failure","job_id":"${JOB_ID}","message":"BUILD FAILED — download build.log untuk detail Gradle.","files":[],"log_key":"${LOG_KEY}","run_url":"https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"}
+          JSON
+          aws s3 cp "${RUNNER_TEMP}/status.json" "s3://${B2_BUCKET}/jobs/${JOB_ID}/status.json" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" --no-progress --content-type application/json
+          aws s3 rm "s3://${B2_BUCKET}/${SOURCE_KEY}" --endpoint-url "$B2_ENDPOINT" --region "$B2_REGION" || true
+          exit 1
