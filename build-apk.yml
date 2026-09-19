@@ -1,0 +1,669 @@
+name: Turbo Android Build
+run-name: Turbo ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Browser job ID
+        required: true
+        type: string
+      release_id:
+        description: Temporary GitHub draft release ID
+        required: true
+        type: string
+      asset_id:
+        description: Uploaded source ZIP release-asset ID
+        required: true
+        type: string
+      asset_name:
+        description: Original ZIP filename
+        required: true
+        type: string
+      variant:
+        description: Android build variant
+        required: true
+        default: debug
+        type: choice
+        options: [debug, release]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: turbo-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+env:
+  JOB_ID: ${{ inputs.job_id }}
+  RELEASE_ID: ${{ inputs.release_id }}
+  SOURCE_ASSET_ID: ${{ inputs.asset_id }}
+  SOURCE_ASSET_NAME: ${{ inputs.asset_name }}
+  GH_API_VERSION: "2026-03-10"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout builder engine
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ "${JOB_ID}" =~ ^job-[0-9]+-[A-Za-z0-9_-]+$ ]] || {
+            echo "Invalid job_id: ${JOB_ID}" >&2
+            exit 2
+          }
+
+          [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]] || {
+            echo "Invalid release_id" >&2
+            exit 2
+          }
+
+          [[ "${SOURCE_ASSET_ID}" =~ ^[0-9]+$ ]] || {
+            echo "Invalid asset_id" >&2
+            exit 2
+          }
+
+          [[ "${SOURCE_ASSET_NAME,,}" == *.zip ]] || {
+            echo "Source file must be .zip" >&2
+            exit 2
+          }
+
+      - name: Initialize detailed build log
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="${RUNNER_TEMP}/build.log"
+
+          {
+            echo "============================================================"
+            echo "Turbo Android Builder V4 — GITHUB DIRECT"
+            echo "============================================================"
+            echo "Timestamp UTC : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Job ID        : ${JOB_ID}"
+            echo "Repository    : ${GITHUB_REPOSITORY}"
+            echo "Run ID        : ${GITHUB_RUN_ID}"
+            echo "Runner        : ${RUNNER_NAME}"
+            echo "Runner OS     : ${RUNNER_OS}"
+            echo "Architecture  : $(uname -m)"
+            echo "Kernel        : $(uname -sr)"
+            echo "Variant       : ${{ inputs.variant }}"
+            echo "Release ID    : ${RELEASE_ID}"
+            echo "Source asset  : ${SOURCE_ASSET_ID}"
+            echo "Source name   : ${SOURCE_ASSET_NAME}"
+            echo
+            echo "===== RUNNER RESOURCES ====="
+            free -h || true
+            df -h / || true
+            echo
+            echo "===== PREINSTALLED TOOLS ====="
+            python3 --version 2>&1 || true
+            curl --version | head -n 1 || true
+            git --version || true
+            echo
+          } > "$LOG"
+
+      - name: Download source ZIP directly from GitHub Release
+        id: download_source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "${RUNNER_TEMP}/build.log") 2>&1
+
+          echo
+          echo "===== DOWNLOAD SOURCE ZIP ====="
+
+          curl --fail --location \
+            --retry 4 \
+            --retry-delay 2 \
+            --retry-all-errors \
+            -H "Accept: application/octet-stream" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${SOURCE_ASSET_ID}" \
+            --output "${RUNNER_TEMP}/project.zip"
+
+          test -s "${RUNNER_TEMP}/project.zip"
+          python3 - <<'PY'
+          import zipfile, os
+          p = os.path.join(os.environ["RUNNER_TEMP"], "project.zip")
+          if not zipfile.is_zipfile(p):
+              raise SystemExit("Downloaded source is not a valid ZIP")
+          print(f"ZIP bytes: {os.path.getsize(p)}")
+          PY
+
+      - name: Delete uploaded source asset from GitHub
+        if: steps.download_source.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl --fail --request DELETE \
+            --retry 3 \
+            --retry-delay 1 \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${SOURCE_ASSET_ID}" \
+            >/dev/null
+
+      - name: Safely extract project
+        id: extract_project
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "${RUNNER_TEMP}/build.log") 2>&1
+
+          echo
+          echo "===== SAFE EXTRACT ====="
+          python3 scripts/safe_extract.py \
+            "${RUNNER_TEMP}/project.zip" \
+            "${RUNNER_TEMP}/project"
+
+      - name: Detect Gradle, AGP, JDK and SDK
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "${RUNNER_TEMP}/build.log") 2>&1
+
+          echo
+          echo "===== TOOLCHAIN DETECTION ====="
+          python3 scripts/detect_toolchain.py "${RUNNER_TEMP}/project"
+
+      - name: Setup Java
+        id: setup_java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ steps.detect.outputs.java_version }}
+
+      - name: Setup Gradle cache for project wrapper
+        id: setup_gradle_wrapper
+        if: steps.detect.outputs.has_wrapper == 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: enhanced
+          cache-read-only: false
+
+      - name: Setup fallback Gradle
+        id: setup_gradle_fallback
+        if: steps.detect.outputs.has_wrapper != 'true'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ steps.detect.outputs.gradle_version }}
+          cache-provider: enhanced
+          cache-read-only: false
+
+      - name: Record resolved Java and Gradle versions
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.project_root }}
+          HAS_WRAPPER: ${{ steps.detect.outputs.has_wrapper }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "${RUNNER_TEMP}/build.log") 2>&1
+
+          echo
+          echo "===== RESOLVED JAVA / GRADLE ====="
+          echo "setup_java outcome            : ${{ steps.setup_java.outcome }}"
+          echo "setup_gradle_wrapper outcome  : ${{ steps.setup_gradle_wrapper.outcome }}"
+          echo "setup_gradle_fallback outcome : ${{ steps.setup_gradle_fallback.outcome }}"
+          echo "project_root                  : ${PROJECT_ROOT}"
+          echo "has_wrapper                   : ${HAS_WRAPPER}"
+          echo
+          java -version 2>&1 || true
+          echo
+
+          if [ "$HAS_WRAPPER" = "true" ] && [ -f "$PROJECT_ROOT/gradlew" ]; then
+            chmod +x "$PROJECT_ROOT/gradlew"
+            (cd "$PROJECT_ROOT" && ./gradlew --version) 2>&1 || true
+          else
+            gradle --version 2>&1 || true
+          fi
+
+      - name: Use preinstalled Android SDK and ensure required platform
+        id: ensure_platform
+        shell: bash
+        env:
+          COMPILE_SDK: ${{ steps.detect.outputs.compile_sdk }}
+        run: |
+          set -euo pipefail
+          exec > >(tee -a "${RUNNER_TEMP}/build.log") 2>&1
+
+          echo
+          echo "===== ANDROID SDK / PLATFORM ====="
+
+          if [ -z "${ANDROID_SDK_ROOT:-}" ]; then
+            if [ -n "${ANDROID_HOME:-}" ]; then
+              export ANDROID_SDK_ROOT="$ANDROID_HOME"
+            else
+              export ANDROID_SDK_ROOT="/usr/local/lib/android/sdk"
+            fi
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          fi
+
+          if [ -z "${ANDROID_HOME:-}" ]; then
+            export ANDROID_HOME="$ANDROID_SDK_ROOT"
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          fi
+
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          test -d "$ANDROID_SDK_ROOT"
+
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            for candidate in \
+              "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+              "$ANDROID_SDK_ROOT"/cmdline-tools/*/bin/sdkmanager
+            do
+              if [ -x "$candidate" ]; then
+                SDKMANAGER="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found." >&2
+            exit 1
+          fi
+
+          echo "sdkmanager=$SDKMANAGER"
+
+          if [ -n "$COMPILE_SDK" ]; then
+            if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-$COMPILE_SDK" ]; then
+              echo "Installing Android platform $COMPILE_SDK..."
+              yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+              "$SDKMANAGER" "platforms;android-$COMPILE_SDK" "platform-tools"
+            else
+              echo "android-$COMPILE_SDK already installed; skipping download."
+            fi
+          else
+            echo "compileSdk was not detected; using runner SDK as-is."
+          fi
+
+      - name: Build APK with Turbo cache
+        id: gradle_build
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.project_root }}
+          HAS_WRAPPER: ${{ steps.detect.outputs.has_wrapper }}
+          BUILD_VARIANT: ${{ inputs.variant }}
+        run: |
+          set -uo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          TASK="assembleDebug"
+          [ "$BUILD_VARIANT" = "release" ] && TASK="assembleRelease"
+
+          LOG="${RUNNER_TEMP}/build.log"
+
+          {
+            echo
+            echo "============================================================"
+            echo "===== GRADLE BUILD START ====="
+            echo "============================================================"
+            echo "Project : $PROJECT_ROOT"
+            echo "Task    : $TASK"
+            echo "Variant : $BUILD_VARIANT"
+            echo "Wrapper : $HAS_WRAPPER"
+            echo "Started : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+          } >> "$LOG"
+
+          set +e
+          if [ "$HAS_WRAPPER" = "true" ]; then
+            chmod +x ./gradlew
+            ./gradlew "$TASK" \
+              --build-cache \
+              --parallel \
+              --stacktrace \
+              --info \
+              --warning-mode all \
+              --console=plain \
+              2>&1 | tee -a "$LOG"
+            code=${PIPESTATUS[0]}
+          else
+            gradle "$TASK" \
+              --build-cache \
+              --parallel \
+              --stacktrace \
+              --info \
+              --warning-mode all \
+              --console=plain \
+              2>&1 | tee -a "$LOG"
+            code=${PIPESTATUS[0]}
+          fi
+          set -e
+
+          {
+            echo
+            echo "===== GRADLE BUILD END ====="
+            echo "Finished : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "Exit code: $code"
+          } >> "$LOG"
+
+          if [ "$code" -ne 0 ]; then
+            {
+              echo
+              echo "============================================================"
+              echo "===== QUICK FAILURE INDEX ====="
+              echo "============================================================"
+              grep -nEi \
+                'FAILURE:|What went wrong:|Execution failed for task|BUILD FAILED|(^|[[:space:]])error:|AAPT2?|Android resource linking failed|Manifest merger failed|Duplicate class|Could not resolve|Could not find|Unresolved reference|Compilation error|Exception|Caused by:' \
+                "$LOG" | tail -n 300 || true
+
+              echo
+              echo "===== GENERATED GRADLE REPORTS ====="
+              find "$PROJECT_ROOT" -type f \( \
+                -name 'problems-report.html' -o \
+                -name '*lint-results*.html' -o \
+                -name '*lint-results*.xml' -o \
+                -name 'test-results*.xml' \
+              \) -print 2>/dev/null | head -n 100 || true
+            } >> "$LOG"
+          fi
+
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Collect APK files
+        id: collect
+        if: steps.gradle_build.outputs.exit_code == '0'
+        shell: bash
+        env:
+          PROJECT_ROOT: ${{ steps.detect.outputs.project_root }}
+        run: |
+          set -euo pipefail
+
+          OUT="${RUNNER_TEMP}/apk-output"
+          mkdir -p "$OUT"
+
+          count=0
+          while IFS= read -r -d '' apk; do
+            count=$((count + 1))
+            rel="${apk#${PROJECT_ROOT}/}"
+            module="${rel%%/build/*}"
+            module="${module//\//-}"
+            base="$(basename "$apk")"
+
+            if [ -n "$module" ] && [ "$module" != "$rel" ]; then
+              target="${module}-${base}"
+            else
+              target="$base"
+            fi
+
+            target="$(printf '%s' "$target" | sed 's/[^A-Za-z0-9._-]/_/g')"
+            [ -e "$OUT/$target" ] && target="${count}-${target}"
+
+            cp "$apk" "$OUT/$target"
+            echo "Collected $target"
+          done < <(
+            find "$PROJECT_ROOT" \
+              -type f \
+              -path '*/build/outputs/apk/*' \
+              -name '*.apk' \
+              ! -name '*unaligned*' \
+              -print0
+          )
+
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+          if [ "$count" -eq 0 ]; then
+            echo "Gradle returned success but no APK was found." >&2
+            exit 3
+          fi
+
+      - name: Publish APK and full log directly to GitHub Release
+        id: publish
+        if: steps.gradle_build.outputs.exit_code == '0' && steps.collect.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          OUT="${RUNNER_TEMP}/apk-output"
+          META="${RUNNER_TEMP}/published-assets.jsonl"
+          : > "$META"
+
+          upload_asset() {
+            local file="$1"
+            local name="$2"
+            local type="$3"
+            local response="${RUNNER_TEMP}/upload-response.json"
+
+            curl --fail --location \
+              --retry 4 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --request POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+              -H "Content-Type: ${type}" \
+              "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${name}" \
+              --data-binary "@${file}" \
+              --output "$response"
+
+            cat "$response" >> "$META"
+            printf '\n' >> "$META"
+          }
+
+          # Clear assets from a retry using the same job id.
+          python3 - <<'PY' > "${RUNNER_TEMP}/cleanup-names.txt"
+          import json, os, urllib.request
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release = os.environ["RELEASE_ID"]
+          job = os.environ["JOB_ID"]
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/releases/{release}/assets?per_page=100",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "X-GitHub-Api-Version": os.environ["GH_API_VERSION"],
+                  "User-Agent": "turbo-android-builder",
+              },
+          )
+          with urllib.request.urlopen(req) as r:
+              assets = json.load(r)
+          for a in assets:
+              if a.get("name", "").startswith(job + "-"):
+                  print(a["id"])
+          PY
+
+          while read -r old_id; do
+            [ -z "$old_id" ] && continue
+            curl --silent --show-error --request DELETE \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${old_id}" \
+              >/dev/null || true
+          done < "${RUNNER_TEMP}/cleanup-names.txt"
+
+          index=0
+          while IFS= read -r -d '' apk; do
+            index=$((index + 1))
+            base="$(basename "$apk")"
+            safe="$(printf '%s' "$base" | sed 's/[^A-Za-z0-9._-]/_/g')"
+            asset_name="${JOB_ID}-result-${index}-${safe}"
+            echo "Uploading ${asset_name}"
+            upload_asset "$apk" "$asset_name" "application/vnd.android.package-archive"
+          done < <(find "$OUT" -maxdepth 1 -type f -name '*.apk' -print0)
+
+          test -f "${RUNNER_TEMP}/build.log" || touch "${RUNNER_TEMP}/build.log"
+          upload_asset \
+            "${RUNNER_TEMP}/build.log" \
+            "${JOB_ID}-build.log" \
+            "text/plain"
+
+          python3 - <<'PY'
+          import json, os, pathlib, datetime
+
+          p = pathlib.Path(os.environ["RUNNER_TEMP"], "published-assets.jsonl")
+          assets = []
+          for line in p.read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              a = json.loads(line)
+              assets.append({
+                  "id": a.get("id"),
+                  "name": a.get("name"),
+                  "size": a.get("size"),
+                  "content_type": a.get("content_type"),
+                  "browser_download_url": a.get("browser_download_url"),
+              })
+
+          apks = [a for a in assets if str(a.get("name", "")).lower().endswith(".apk")]
+          log_asset = next(
+              (a for a in assets if str(a.get("name", "")).endswith("-build.log")),
+              None,
+          )
+
+          data = {
+              "state": "success",
+              "job_id": os.environ["JOB_ID"],
+              "message": "BUILD SUCCESSFUL — APK ready on GitHub.",
+              "files": apks,
+              "log": log_asset,
+              "run_url": (
+                  f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              ),
+              "finished_at": datetime.datetime.now(
+                  datetime.timezone.utc
+              ).isoformat(),
+          }
+
+          pathlib.Path(
+              os.environ["RUNNER_TEMP"], "status.json"
+          ).write_text(json.dumps(data, indent=2), encoding="utf-8")
+          PY
+
+          upload_asset \
+            "${RUNNER_TEMP}/status.json" \
+            "${JOB_ID}-status.json" \
+            "application/json"
+
+      - name: Publish failure log and status
+        if: always() && steps.publish.outcome != 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+
+          LOG="${RUNNER_TEMP}/build.log"
+          test -f "$LOG" || touch "$LOG"
+
+          {
+            echo
+            echo "============================================================"
+            echo "===== FINAL JOB DIAGNOSTICS ====="
+            echo "============================================================"
+            echo "download_source      = ${{ steps.download_source.outcome }}"
+            echo "extract_project      = ${{ steps.extract_project.outcome }}"
+            echo "detect_toolchain     = ${{ steps.detect.outcome }}"
+            echo "setup_java           = ${{ steps.setup_java.outcome }}"
+            echo "setup_gradle_wrapper = ${{ steps.setup_gradle_wrapper.outcome }}"
+            echo "setup_gradle_fallback= ${{ steps.setup_gradle_fallback.outcome }}"
+            echo "android_sdk/platform = ${{ steps.ensure_platform.outcome }}"
+            echo "gradle_exit_code     = ${{ steps.gradle_build.outputs.exit_code || 'not-started' }}"
+            echo "collect_apk          = ${{ steps.collect.outcome }}"
+            echo
+            echo "Detected:"
+            echo "  wrapper    = ${{ steps.detect.outputs.has_wrapper || 'unknown' }}"
+            echo "  AGP        = ${{ steps.detect.outputs.agp_version || 'unknown' }}"
+            echo "  Gradle     = ${{ steps.detect.outputs.gradle_version || 'unknown' }}"
+            echo "  Java       = ${{ steps.detect.outputs.java_version || 'unknown' }}"
+            echo "  compileSdk = ${{ steps.detect.outputs.compile_sdk || 'unknown' }}"
+            echo
+            echo "Actions run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$LOG"
+
+          # Best-effort cleanup of the source asset if an earlier step failed.
+          curl --silent --show-error --request DELETE \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${SOURCE_ASSET_ID}" \
+            >/dev/null 2>&1 || true
+
+          # Delete stale failure assets for this same job id before re-upload.
+          python3 - <<'PY' > "${RUNNER_TEMP}/failure-old-assets.txt" 2>/dev/null
+          import json, os, urllib.request
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          release = os.environ["RELEASE_ID"]
+          job = os.environ["JOB_ID"]
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{repo}/releases/{release}/assets?per_page=100",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "X-GitHub-Api-Version": os.environ["GH_API_VERSION"],
+                  "User-Agent": "turbo-android-builder",
+              },
+          )
+          with urllib.request.urlopen(req) as r:
+              assets = json.load(r)
+          wanted = {f"{job}-build.log", f"{job}-status.json"}
+          for a in assets:
+              if a.get("name") in wanted:
+                  print(a["id"])
+          PY
+
+          while read -r old_id; do
+            [ -z "$old_id" ] && continue
+            curl --silent --request DELETE \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${old_id}" \
+              >/dev/null || true
+          done < "${RUNNER_TEMP}/failure-old-assets.txt"
+
+          cat > "${RUNNER_TEMP}/status.json" <<JSON
+          {
+            "state": "failure",
+            "job_id": "${JOB_ID}",
+            "message": "BUILD FAILED — open the full build log for diagnostics.",
+            "files": [],
+            "run_url": "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          JSON
+
+          curl --fail --location --request POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+            -H "Content-Type: text/plain" \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${JOB_ID}-build.log" \
+            --data-binary "@${LOG}" \
+            >/dev/null || true
+
+          curl --fail --location --request POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: ${GH_API_VERSION}" \
+            -H "Content-Type: application/json" \
+            "https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?name=${JOB_ID}-status.json" \
+            --data-binary "@${RUNNER_TEMP}/status.json" \
+            >/dev/null || true
+
+          exit 1
